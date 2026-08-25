@@ -192,7 +192,7 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         self._chdir(self.work_dir)
         formatted_branch = self.config.formatted_branch
 
-        self._run_cmd(f"$REPO init --depth=1 --u https://android.googlesource.com/kernel/manifest "
+        self._run_cmd(f"$REPO init --depth=1 -u https://android.googlesource.com/kernel/manifest "
                      f"-b common-{formatted_branch} --repo-rev=v2.16", check=False)
 
         remote = subprocess.run(f"git ls-remote https://android.googlesource.com/kernel/common {formatted_branch}",
@@ -261,23 +261,33 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
     def add_bbg(self):
         if not self.config.use_bbg:
             return
-        logger.info("=== 添加 Baseband-guard ===")
+        logger.info("=== Adding Baseband-guard ===")
         common_dir = self.work_dir / "common"
         if not common_dir.exists():
             return
         self._chdir(common_dir)
         self._run_cmd(f"wget -O- {BBG_CONFIG['setup_script']} | bash", check=False)
+        
+        # 1. Update gki_defconfig
         config_file = common_dir / "arch/arm64/configs/gki_defconfig"
         if config_file.exists():
             with open(config_file, "a") as f:
                 f.write("CONFIG_BBG=y\n")
+        
+        # 2. Update security/Kconfig safely
         kconfig_file = common_dir / "security/Kconfig"
         if kconfig_file.exists():
             with open(kconfig_file, "r") as f:
                 content = f.read()
-            content = re.sub(r'(config LSM.*?)(default .*)(\n.*?help)',
-                           lambda m: m.group(1) + ('lockdown,baseband_guard' if 'lockdown' in m.group(2) and 'baseband_guard' not in m.group(2) else m.group(2)) + m.group(3),
-                           content, flags=re.DOTALL)
+            
+            # Safely insert baseband_guard into the LSM list if not already present
+            if 'baseband_guard' not in content:
+                # Target the default string and append our module
+                if 'lockdown,' in content:
+                    content = content.replace('lockdown,', 'lockdown,baseband_guard,')
+                elif 'lockdown' in content:
+                    content = content.replace('lockdown', 'lockdown,baseband_guard')
+            
             with open(kconfig_file, "w") as f:
                 f.write(content)
 
@@ -313,14 +323,15 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
             return
         logger.info("=== 应用 ZRAM (LZ4KD) 补丁 ===")
         self._chdir(self.work_dir / "common")
-        for src in [
-            (self.sukisu_patch_dir / "other/zram/lz4k/include/linux", "include/linux/"),
-            (self.sukisu_patch_dir / "other/zram/lz4k/lib", "lib/"),
-            (self.sukisu_patch_dir / "other/zram/lz4k/crypto", "crypto/"),
-            (self.sukisu_patch_dir / "other/zram/lz4k_oplus", "lib/"),
+        for dst, src_dir in [
+            ("include/linux", self.sukisu_patch_dir / "other/zram/lz4k/include/linux"),
+            ("lib",           self.sukisu_patch_dir / "other/zram/lz4k/lib"),
+            ("crypto",        self.sukisu_patch_dir / "other/zram/lz4k/crypto"),
+            ("lib/lz4k_oplus", self.sukisu_patch_dir / "other/zram/lz4k_oplus"),
         ]:
-            if src[0].exists():
-                self._run_cmd(f"cp -r {src[0]}/* {src[1]}", check=False)
+            if src_dir.exists():
+                self._run_cmd(f"mkdir -p {dst}", check=False)
+                self._run_cmd(f"cp -rn {src_dir}/* {dst}/", check=False)
         zram_patch_dir = self.sukisu_patch_dir / f"other/zram/zram_patch/{self.config.kernel_version}"
         for patch in ["lz4kd.patch", "lz4k_oplus.patch"]:
             p = zram_patch_dir / patch
@@ -351,6 +362,27 @@ CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
                 content = content.replace("goto show_pad;", "return 0;")
                 with open(task_mmu, "w") as f:
                     f.write(content)
+
+        # Fix VMA_PAD_START/VMA_PAD_END not available in 5.10
+        if "VMA_PAD_START" in content and "#ifndef VMA_PAD_START" not in content:
+            insert_after = '#include "internal.h"\n'
+            if insert_after in content:
+                content = content.replace(insert_after,
+                    insert_after +
+                    '\n#ifndef VMA_PAD_START\n'
+                    '#define VMA_PAD_START(vma) ((vma)->vm_start)\n'
+                    '#endif\n'
+                    '#ifndef VMA_PAD_END\n'
+                    '#define VMA_PAD_END(vma) ((vma)->vm_end)\n'
+                    '#endif\n', 1)
+                with open(task_mmu, "w") as f:
+                    f.write(content)
+
+        # Fix uninitialized 'dentry' variable (Clang -Werror,-Wsometimes-uninitialized)
+        if 'struct dentry *dentry;' in content and 'struct dentry *dentry = NULL;' not in content:
+            content = content.replace('struct dentry *dentry;', 'struct dentry *dentry = NULL;', 1)
+            with open(task_mmu, "w") as f:
+                f.write(content)
 
     def _fix_base_c_header(self):
         base_c = self.work_dir / "common/fs/proc/base.c"

@@ -54,7 +54,7 @@ on:
         description: '发送 Telegram 通知'
         required: true
         type: boolean
-        default: true
+        default: false
 
 env:
   PYTHON_VERSION: '3.10'
@@ -123,6 +123,12 @@ jobs:
           BOOT_SIGN_KEY: ${{ secrets.BOOT_SIGN_KEY }}
         run: |
           mkdir -p toolchain/linux-x86/bin
+          if [ -z "$BOOT_SIGN_KEY" ]; then
+            echo "BOOT_SIGN_KEY not set, generating temporary AVB key..."
+            openssl genrsa -out toolchain/linux-x86/bin/testkey.pem 2048
+          else
+            echo "$BOOT_SIGN_KEY" > toolchain/linux-x86/bin/testkey.pem
+          fi
           echo "$BOOT_SIGN_KEY" > toolchain/linux-x86/bin/testkey.pem
           echo "BOOT_SIGN_KEY_PATH=$GITHUB_WORKSPACE/toolchain/linux-x86/bin/testkey.pem" >> $GITHUB_ENV
 
